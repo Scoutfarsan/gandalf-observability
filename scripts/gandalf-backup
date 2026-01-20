@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+
+ENV_FILE="/etc/gandalf/backup.env"
+[[ -r "$ENV_FILE" ]] && source "$ENV_FILE" || true
+
+set -euo pipefail
+
+# --- Config (env overridable) ---
+SRC_DIRS="${SRC_DIRS:-/etc /opt /usr/local/sbin /etc/pihole}"
+EXCLUDES="${EXCLUDES:-/var/backups/gandalf /var/cache /var/tmp /tmp /proc /sys /dev /run /mnt /media}"
+
+NICE_LEVEL="${NICE_LEVEL:-10}"
+IONICE_CLASS="${IONICE_CLASS:-2}"
+IONICE_LEVEL="${IONICE_LEVEL:-7}"
+
+# ntfy
+NTFY_URL="${NTFY_URL:-https://ntfy.sh}"
+NTFY_TOPIC="${NTFY_TOPIC:-}"
+NTFY_TOKEN="${NTFY_TOKEN:-}"
+NTFY_PREFIX="${NTFY_PREFIX:-}"
+
+# rclone
+RCLONE_CONFIG="${RCLONE_CONFIG:-/etc/rclone/rclone.conf}"
+RCLONE_REMOTE="${RCLONE_REMOTE:-gdrive:backups/$(hostname -s)}"
+REMOTE_RETENTION_DAYS="${REMOTE_RETENTION_DAYS:-5}"
+
+# local minimal temp (log only)
+LOCAL_TMP_DIR="${LOCAL_TMP_DIR:-/var/backups/gandalf/.tmp}"
+
+ts(){ date "+%Y-%m-%d %H:%M:%S %Z"; }
+log(){ local m="[$(ts)] $*"; logger -t gandalf-backup -- "$m" || true; [[ -t 1 ]] && echo "$m" || true; }
+
+ntfy_post() {
+  local title="$1"; shift || true
+  local body="$*"
+  [[ -n "${NTFY_TOPIC:-}" ]] || return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  local url="${NTFY_URL%/}/${NTFY_TOPIC}"
+  local auth=()
+  [[ -n "${NTFY_TOKEN:-}" ]] && auth=(-H "Authorization: Bearer ${NTFY_TOKEN}")
+  curl -fsS "${auth[@]}" \
+    -H "Title: ${NTFY_PREFIX}${title}" \
+    -H "Priority: 3" \
+    -H "Tags: floppy_disk" \
+    --data "${body}" \
+    "$url" >/dev/null || true
+}
+
+ntfy_ok()   { ntfy_post "Backup OK"   "$*"; }
+ntfy_fail() { ntfy_post "Backup FAIL" "$*"; }
+
+cleanup_local_tmp() {
+  install -d -m 0750 -o root -g adm "$LOCAL_TMP_DIR"
+  find "$LOCAL_TMP_DIR" -maxdepth 1 -type f -name "*.log" -mmin +1440 -delete 2>/dev/null || true
+}
+
+cleanup_remote() {
+  command -v rclone >/dev/null 2>&1 || return 0
+
+  # ofärdiga
+  RCLONE_CONFIG="$RCLONE_CONFIG" rclone delete "$RCLONE_REMOTE" --include "*.partial" >/dev/null 2>&1 || true
+
+  # retention
+  RCLONE_CONFIG="$RCLONE_CONFIG" rclone delete "$RCLONE_REMOTE" --min-age "${REMOTE_RETENTION_DAYS}d" --include "*.tar.gz" >/dev/null 2>&1 || true
+  RCLONE_CONFIG="$RCLONE_CONFIG" rclone delete "$RCLONE_REMOTE" --min-age "${REMOTE_RETENTION_DAYS}d" --include "*.log"    >/dev/null 2>&1 || true
+}
+
+main() {
+  command -v rclone >/dev/null 2>&1 || { echo "ERROR: rclone missing"; exit 1; }
+  [[ -r "$RCLONE_CONFIG" ]] || { echo "ERROR: RCLONE_CONFIG not readable: $RCLONE_CONFIG"; exit 1; }
+
+  local host stamp
+  host="$(hostname -s 2>/dev/null || hostname)"
+  stamp="$(date +%Y%m%d-%H%M%S)"
+
+  cleanup_local_tmp
+
+  local logp="${LOCAL_TMP_DIR}/${host}-${stamp}.log"
+
+  : >"$logp"
+  chmod 0640 "$logp" 2>/dev/null || true
+  chown root:adm "$logp" 2>/dev/null || true
+    exec > >(tee -a "$logp") 2> >(tee -a "$logp" >&2)
+
+  local remote_partial="${RCLONE_REMOTE}/${host}-${stamp}.tar.gz.partial"
+  local remote_final="${RCLONE_REMOTE}/${host}-${stamp}.tar.gz"
+  local remote_log="${RCLONE_REMOTE}/${host}-${stamp}.log"
+
+  log "BACKUP: start -> ${remote_final}"
+  ntfy_post "Gandalf" "3" "information_source" "gandalf-backup-start" "Backup start: ${host} ${stamp}"
+
+  # build exclude args
+  local ex_args=()
+  while IFS= read -r x; do
+    [[ -n "$x" ]] && ex_args+=(--exclude="$x")
+  done < <(printf "%s\n" $EXCLUDES)
+
+  # build src args (only existing)
+  local src_args=()
+  for d in $SRC_DIRS; do
+    [[ -e "$d" ]] && src_args+=("$d") || echo "SKIP: missing $d" >>"$logp"
+  done
+
+  # rotate remote before upload
+  cleanup_remote
+
+  # STREAM: tar -> pigz (om finns) -> rclone rcat remote_partial
+  # (rcat är gjord för stdin streaming och är robustare än copyto+fifo för Drive)
+  set +e
+  if command -v pigz >/dev/null 2>&1; then
+    nice -n "$NICE_LEVEL" ionice -c "$IONICE_CLASS" -n "$IONICE_LEVEL" \
+      tar -c "${ex_args[@]}" "${src_args[@]}" -f - 2> >(tee -a "$logp" | systemd-cat -t gandalf-backup -p info) \
+      | pigz 2> >(tee -a "$logp" | systemd-cat -t gandalf-backup -p info) \
+      | RCLONE_CONFIG="$RCLONE_CONFIG" rclone rcat \
+          "$remote_partial" \
+          --drive-chunk-size 64M \
+          --retries 10 --retries-sleep 30s --timeout 30m --contimeout 30s \
+          --stats 60s --stats-one-line 2> >(tee -a "$logp" | systemd-cat -t gandalf-backup -p info)
+    pipe_rc=${PIPESTATUS[*]}
+  else
+    nice -n "$NICE_LEVEL" ionice -c "$IONICE_CLASS" -n "$IONICE_LEVEL" \
+      tar -czf - "${ex_args[@]}" "${src_args[@]}" 2> >(tee -a "$logp" | systemd-cat -t gandalf-backup -p info) \
+      | RCLONE_CONFIG="$RCLONE_CONFIG" rclone rcat \
+          "$remote_partial" \
+          --drive-chunk-size 64M \
+          --retries 10 --retries-sleep 30s --timeout 30m --contimeout 30s \
+          --stats 60s --stats-one-line 2> >(tee -a "$logp" | systemd-cat -t gandalf-backup -p info)
+    pipe_rc=${PIPESTATUS[*]}
+  fi
+  set -e
+
+  # PIPESTATUS innehåller flera rc, vi failar om någon != 0
+  if echo "$pipe_rc" | tr " " "\n" | grep -qv "^0$"; then
+    echo "[$(ts)] ERROR: pipeline rc(s) = $pipe_rc" >>"$logp"
+    RCLONE_CONFIG="$RCLONE_CONFIG" rclone deletefile "$remote_partial" >/dev/null 2>&1 || true
+    RCLONE_CONFIG="$RCLONE_CONFIG" rclone copyto "$logp" "$remote_log" >/dev/null 2>&1 || true
+    ntfy_post "Gandalf" "5" "x,warning" "gandalf-backup-fail" "Backup FAIL: ${host} ${stamp} (pipeline=$pipe_rc)"
+    exit 1
+  fi
+
+  # finalize: partial -> final
+  RCLONE_CONFIG="$RCLONE_CONFIG" rclone moveto \
+    "$remote_partial" "$remote_final" \
+    --retries 10 --retries-sleep 30s --timeout 30m --contimeout 30s \
+    --stats 60s --stats-one-line >>"$logp" 2>&1
+
+  # upload log (best effort)
+  RCLONE_CONFIG="$RCLONE_CONFIG" rclone copyto \
+    "$logp" "$remote_log" \
+    --retries 10 --retries-sleep 10s --timeout 10m --contimeout 30s \
+    >/dev/null 2>&1 || true
+
+  log "BACKUP: OK -> ${remote_final}"
+  ntfy_post "Gandalf" "4" "cloud,white_check_mark" "gandalf-backup-ok" "Backup OK: ${host} ${stamp}"
+
+  rm -f -- "$logp" 2>/dev/null || true
+}
+main "$@"
