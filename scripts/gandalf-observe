@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+OUT_DIR="/var/www/html/gandalf"
+JSON="$OUT_DIR/status.json"
+TXT="$OUT_DIR/status.txt"
+
+ENV_FILE="/etc/gandalf/backup.env"
+RCLONE_CONFIG_DEFAULT="/etc/rclone/rclone.conf"
+
+mkdir -p "$OUT_DIR"
+
+ts_iso(){ date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+ts_local(){ date +"%Y-%m-%d %H:%M:%S %Z"; }
+
+# safe read env (optional)
+set +u
+if [[ -r "$ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+fi
+set -u
+
+HOST="$(hostname -s 2>/dev/null || hostname)"
+NOW_ISO="$(ts_iso)"
+NOW_LOCAL="$(ts_local)"
+
+# --- backup status from journal ---
+last_ok_line="$(journalctl -t gandalf-backup --since "72 hours ago" -o cat --no-pager 2>/dev/null | grep -F "BACKUP: OK" | tail -n 1 || true)"
+last_start_line="$(journalctl -t gandalf-backup --since "72 hours ago" -o cat --no-pager 2>/dev/null | grep -F "BACKUP: start" | tail -n 1 || true)"
+
+# Parse: "[YYYY-mm-dd HH:MM:SS Z] BACKUP: OK -> remote:path"
+backup_last_ok_at=""
+backup_last_ok_target=""
+if [[ -n "${last_ok_line:-}" ]]; then
+  backup_last_ok_at="$(echo "$last_ok_line" | sed -nE "s/^\\[([^]]+)\\].*/\\1/p")"
+  backup_last_ok_target="$(echo "$last_ok_line" | sed -nE "s/.*OK -> (.*)$/\\1/p")"
+fi
+
+backup_last_start_at=""
+backup_last_start_target=""
+if [[ -n "${last_start_line:-}" ]]; then
+  backup_last_start_at="$(echo "$last_start_line" | sed -nE "s/^\\[([^]]+)\\].*/\\1/p")"
+  backup_last_start_target="$(echo "$last_start_line" | sed -nE "s/.*start -> (.*)$/\\1/p")"
+fi
+
+# --- rclone remote quick peek (optional) ---
+rclone_ok=0
+remote_latest=""
+remote_latest_size=""
+remote_count=""
+
+RCLONE_CONFIG="${RCLONE_CONFIG:-$RCLONE_CONFIG_DEFAULT}"
+RCLONE_REMOTE="${RCLONE_REMOTE:-gdrive:backups/gandalf}"
+
+if command -v rclone >/dev/null 2>&1 && [[ -r "$RCLONE_CONFIG" ]]; then
+  # list only recent-ish objects; keep it cheap
+  # lsl: "  size yyyy-mm-dd hh:mm:ss.name"
+  remote_latest="$(RCLONE_CONFIG="$RCLONE_CONFIG" rclone lsl "$RCLONE_REMOTE" 2>/dev/null | awk "/\\.tar\\.gz$/{print}" | tail -n 1 || true)"
+  if [[ -n "$remote_latest" ]]; then
+    rclone_ok=1
+    remote_latest_size="$(echo "$remote_latest" | awk "{print \$1}")"
+    remote_latest="$(echo "$remote_latest" | sed -nE "s/^\\s*[0-9]+\\s+[0-9-]+\\s+[0-9:]+\\s+//p")"
+    remote_count="$(RCLONE_CONFIG="$RCLONE_CONFIG" rclone lsf "$RCLONE_REMOTE" --max-depth 1 2>/dev/null | wc -l | tr -d " " || true)"
+  fi
+fi
+
+# --- timers / services ---
+timer_backup_next="$(systemctl list-timers --no-pager 2>/dev/null | awk "/gandalf-backup\\.timer/{print \$1\" \"\$2\" \"\$3\" \"\$4\" \"\$5\" \"\$6\" \"\$7\" \"\$8\" \"\$9\" \"\$10}" | sed -E "s/[[:space:]]+/ /g" || true)"
+timer_health_next="$(systemctl list-timers --no-pager 2>/dev/null | awk "/gandalf-healthcheck\\.timer/{print \$1\" \"\$2\" \"\$3\" \"\$4\" \"\$5\" \"\$6\" \"\$7\" \"\$8\" \"\$9\" \"\$10}" | sed -E "s/[[:space:]]+/ /g" || true)"
+
+svc_state(){
+  local u="$1"
+  systemctl show "$u" -p ActiveState -p SubState -p Result --no-pager 2>/dev/null \
+    | tr "\n" " " | sed -E "s/[[:space:]]+/ /g; s/ $//"
+}
+
+# units you care about (match your backup.env OBS_UNITS if present)
+OBS_UNITS_DEFAULT="pihole-FTL.service unbound.service tailscaled.service ssh.service gandalf-backup.service gandalf-healthcheck.service"
+OBS_UNITS="${OBS_UNITS:-$OBS_UNITS_DEFAULT}"
+
+units_json=""
+units_txt=""
+for u in $OBS_UNITS; do
+  st="$(svc_state "$u")"
+  units_txt+="$u: ${st:-<no-data>}\n"
+  # json-safe-ish (minimal)
+  units_json+="{\"unit\":\"$u\",\"state\":\"${st//\"/\\\"}\"},"
+done
+units_json="[${units_json%,}]"
+
+# --- host metrics ---
+loadavg="$(awk "{print \$1\" \"\$2\" \"\$3}" /proc/loadavg 2>/dev/null || echo "")"
+mem_kb="$(awk "/MemTotal/{t=\$2}/MemAvailable/{a=\$2} END{print t\" \"a}" /proc/meminfo 2>/dev/null || echo "")"
+mem_total_kb="$(echo "$mem_kb" | awk "{print \$1}" )"
+mem_avail_kb="$(echo "$mem_kb" | awk "{print \$2}" )"
+
+disk_root="$(df -hP / 2>/dev/null | awk "NR==2{print \$2\" \"\$3\" \"\$4\" \"\$5}" || true)"
+upt="$(uptime -p 2>/dev/null || true)"
+
+cpu_temp_c=""
+for p in /sys/class/thermal/thermal_zone*/temp; do
+  if [[ -r "$p" ]]; then
+    v="$(cat "$p" 2>/dev/null || true)"
+    if [[ "$v" =~ ^[0-9]+$ ]]; then
+      cpu_temp_c="$(awk -v t="$v" "BEGIN{printf \"%.1f\", t/1000}")"
+      break
+    fi
+  fi
+done
+
+# --- Write TXT ---
+{
+  echo "Gandalf Observability"
+  echo "Host: $HOST"
+  echo "Now:  $NOW_LOCAL"
+  echo
+  echo "Backup:"
+  echo "  Last OK:    ${backup_last_ok_at:-<none>}"
+  echo "  Target:     ${backup_last_ok_target:-<none>}"
+  echo "  Last start: ${backup_last_start_at:-<none>}"
+  echo "  Start tgt:  ${backup_last_start_target:-<none>}"
+  echo
+  echo "Remote:"
+  echo "  rclone_ok:  $rclone_ok"
+  echo "  latest:     ${remote_latest:-<none>}"
+  echo "  size:       ${remote_latest_size:-<none>} bytes"
+  echo "  count:      ${remote_count:-<none>}"
+  echo
+  echo "Timers:"
+  echo "  backup:     ${timer_backup_next:-<no-row>}"
+  echo "  health:     ${timer_health_next:-<no-row>}"
+  echo
+  echo "Host metrics:"
+  echo "  uptime:     ${upt:-<none>}"
+  echo "  loadavg:    ${loadavg:-<none>}"
+  echo "  mem_kb:     total=${mem_total_kb:-?} avail=${mem_avail_kb:-?}"
+  echo "  disk(/):    ${disk_root:-<none>}"
+  echo "  cpu_temp:   ${cpu_temp_c:-<none>} C"
+  echo
+  echo "Units:"
+  printf "%b" "$units_txt"
+} > "$TXT"
+
+# --- Write JSON (simple, stable keys) ---
+cat > "$JSON" <<J
+{
+  "host": "$(printf "%s" "$HOST")",
+  "now_utc": "$(printf "%s" "$NOW_ISO")",
+  "now_local": "$(printf "%s" "$NOW_LOCAL")",
+  "backup": {
+    "last_ok_at": "$(printf "%s" "${backup_last_ok_at:-}")",
+    "last_ok_target": "$(printf "%s" "${backup_last_ok_target:-}")",
+    "last_start_at": "$(printf "%s" "${backup_last_start_at:-}")",
+    "last_start_target": "$(printf "%s" "${backup_last_start_target:-}")"
+  },
+  "remote": {
+    "rclone_ok": $rclone_ok,
+    "latest_tar_gz": "$(printf "%s" "${remote_latest:-}")",
+    "latest_size_bytes": "$(printf "%s" "${remote_latest_size:-}")",
+    "object_count": "$(printf "%s" "${remote_count:-}")"
+  },
+  "host_metrics": {
+    "uptime_pretty": "$(printf "%s" "${upt:-}")",
+    "loadavg": "$(printf "%s" "${loadavg:-}")",
+    "mem_total_kb": "$(printf "%s" "${mem_total_kb:-}")",
+    "mem_avail_kb": "$(printf "%s" "${mem_avail_kb:-}")",
+    "disk_root": "$(printf "%s" "${disk_root:-}")",
+    "cpu_temp_c": "$(printf "%s" "${cpu_temp_c:-}")"
+  },
+  "timers": {
+    "backup_row": "$(printf "%s" "${timer_backup_next:-}" | sed "s/\"/\\\\\"/g")",
+    "healthcheck_row": "$(printf "%s" "${timer_health_next:-}" | sed "s/\"/\\\\\"/g")"
+  },
+  "units": $units_json
+}
+J
+
+chmod 0644 "$JSON" "$TXT" || true
+echo "OK: wrote $JSON and $TXT"
