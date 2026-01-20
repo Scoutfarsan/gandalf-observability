@@ -1,0 +1,16 @@
+[Unit]
+Description=Gandalf backup (tar+pigz->FIFO->rclone->gdrive+rotate+ntfy)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/gandalf/backup.env
+ExecStart=/usr/bin/flock -n /run/gandalf-backup.lock /usr/local/sbin/gandalf-backup
+TimeoutStartSec=infinity
+TimeoutStopSec=120
+KillSignal=SIGINT
+KillMode=control-group
+SendSIGKILL=yes
+StandardOutput=journal
+StandardError=journal

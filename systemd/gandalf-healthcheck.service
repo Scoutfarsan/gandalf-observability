@@ -1,0 +1,13 @@
+[Unit]
+Description=Gandalf healthcheck (silent OK, ntfy on failure)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/gandalf/backup.env
+ExecStart=/usr/local/sbin/gandalf-healthcheck
+TimeoutStartSec=2m
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gandalf-healthcheck

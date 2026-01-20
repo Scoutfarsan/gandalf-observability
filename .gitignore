@@ -4,3 +4,5 @@ backup.env
 *.key
 *.pem
 *.token
+*.secrets
+rclone.conf

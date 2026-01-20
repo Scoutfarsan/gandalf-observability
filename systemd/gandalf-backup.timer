@@ -1,0 +1,10 @@
+[Unit]
+Description=Gandalf scheduled backup (daily night)
+
+[Timer]
+OnCalendar=*-*-* 02:10:00
+RandomizedDelaySec=20min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Gandalf healthcheck (every 10 min)
+
+[Timer]
+OnCalendar=*:0/10
+Persistent=true
+RandomizedDelaySec=60s
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
